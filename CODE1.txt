@@ -1,0 +1,826 @@
+/*
+ * ESP32 Local Air Quality & Weather Station
+ * * Features:
+ * - Hosts a Wi-Fi Access Point (AP) for local connection.
+ * - Serves a real-time web dashboard to any connected device.
+ * - Reads DHT11 (Temp/Humidity), BMP180 (Pressure), and MQ-135, MQ-4 (Gas Sensors) via ADS1115.
+ * - Displays data on a local OLED screen.
+ * - Saves MQ sensor calibration data to ESP32's non-volatile (Preferences) memory.
+ * - Uses non-blocking timers (millis()) for responsive web server and OLED updates.
+ */
+
+// --- LIBRARIES ---
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h> 
+#include <Preferences.h> // For storing MQ sensor calibration data
+#include <Adafruit_ADS1X15.h>
+#include <Adafruit_BMP085.h> // Library for BMP180
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h> // Added for DHT11
+
+// --- CONFIGURATION CONSTANTS ---
+
+// 1. Wi-Fi Configuration (Always AP Mode)
+const char* AP_SSID = "AQI";
+const char* AP_PASSWORD = "MonkeyLabs";
+
+// 2. I2C Pin Definitions
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define ADS1115_ADDRESS 0x48
+
+// 3. DHT11 Sensor Pin
+#define DHT_PIN 4       // Using GPIO 4 for DHT11
+#define DHT_TYPE DHT11  // Using DHT11 sensor
+
+
+// 4. ADS1115 Analog Configuration
+const float ADS_FS_VOLTAGE = 4.096F;
+const float ADS_COUNTS = 32767.0F;
+const float VCC_SENSOR = 5.0F;
+const float RL = 10000.0F; // Load resistor typically 10kΩ
+
+// Clean-air Rs/R0 ratios (used for initial calibration)
+const float RATIO_CLEAN_MQ135 = 3.6;
+// const float RATIO_CLEAN_MQ7   = 27.0; // REMOVED
+const float RATIO_CLEAN_MQ4   = 4.4;
+
+
+
+// PPM equation constants (from your sensor logic)
+const float MQ135_A = 116.6020682, MQ135_B = -2.769034857;
+// const float MQ7_A   = 99.042,      MQ7_B   = -1.518; // REMOVED
+const float MQ4_A   = 1012.7,      MQ4_B   = -2.786;
+
+// ADS1115 channels (MQ-7 removed)
+#define CH_MQ135 0
+#define CH_MQ4   1 // Re-assigned to channel 1
+
+// --- HARDWARE OBJECTS ---
+Adafruit_ADS1115 ads;
+Preferences prefs;
+Adafruit_BMP085 bmp; // BMP180 uses this library
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+DHT dht(DHT_PIN, DHT_TYPE); // Added DHT object
+WebServer server(80);
+
+// --- GLOBAL VARIABLES for Web and Calibration ---
+float R0_MQ135 = 0, R0_MQ4 = 0; // Calibration R0 values (MQ-7 removed)
+
+// Variables to hold the LATEST sensor readings for the web server and OLED
+float current_ppm135 = 0;
+// float current_ppm7 = 0; // REMOVED
+float current_ppm4 = 0;
+float current_temp = 0;
+float current_humidity = 0; // Added for DHT11
+float current_press = 0;
+String current_cond = "N/A";
+
+// Global variables for timing the sensor readings and OLED rotation
+unsigned long lastSensorReadTime = 0;
+const long sensorInterval = 5000; // Read sensors every 5 seconds (5000 ms)
+
+unsigned long lastOLEDUpdateTime = 0;
+const long oledInterval = 3000; // Rotate OLED screen every 3 seconds (3000 ms)
+int currentOLED_Screen = 1; // Tracks which screen to show
+
+
+// --- FUNCTION PROTOTYPES ---
+void connectToWiFi();
+void i2cScanner();
+void updateGlobalReadings();
+void handleRoot();
+void handleSensorData();
+void showProjectName();
+void dhtReadings(float &temperature, float &humidity); // Added
+void bmpReadings(float &pressure, String &condition); // Modified
+void showGasScreen(float ppm135, float ppm4); // Modified
+void showWeatherScreen(float temperature, float humidity, float pressure, String condition); // Modified
+String getWeatherCondition(float pressure_hPa);
+
+
+// ---------- HELPER FUNCTIONS (Sensor Math) ----------
+// (Unchanged functions: adcToVolts, dividerToVin, computeRs, getRs, getPPM)
+
+float adcToVolts(int16_t raw) { return raw * (ADS_FS_VOLTAGE / ADS_COUNTS); }
+float computeRs(float vin) { return (VCC_SENSOR - vin) * RL / vin; }
+
+float getRs(uint8_t ch) {
+  int16_t raw = ads.readADC_SingleEnded(ch);
+  float vin = raw * (ADS_FS_VOLTAGE / ADS_COUNTS); // Direct MQ135 AOUT → ADS1115
+  return (VCC_SENSOR - vin) * RL / vin;  // Standard MQ Rs formula
+}
+
+float getPPM(float Rs, float R0, float a, float b) {
+  if (R0 <= 0 || Rs <= 0) return 0; // Prevent division by zero
+  return a * pow((Rs / R0), b);
+}
+
+// ---------- CALIBRATION FUNCTION ----------
+// (Unchanged)
+float calibrateSensor(uint8_t channel, float clean_ratio, const char* label) {
+  Serial.printf("Calibrating %s... Keep in clean air.\n", label);
+  float sum = 0; int count = 0;
+  for (int i = 0; i < 100; i++) {
+    float Rs = getRs(channel);
+    if (Rs > 0) { sum += Rs; count++; }
+    delay(100); // Wait 100ms between reads (total 10 seconds)
+  }
+  float Rs_mean = sum / count;
+  float R0 = Rs_mean / clean_ratio;
+  Serial.printf("%s calibration complete. R0 = %.2f \u03A9\n", label, R0);
+  return R0;
+}
+
+// ---------- SENSOR READING FUNCTIONS ----------
+/**
+ * Reads all MQ sensors and updates their PPM values (passed by reference).
+ * MQ-7 removed.
+ */
+void mqReadings(float &ppm135, float &ppm4) {
+  ppm135 = getPPM(getRs(CH_MQ135), R0_MQ135, MQ135_A, MQ135_B);
+  // ppm7   = getPPM(getRs(CH_MQ7),   R0_MQ7,   MQ7_A,   MQ7_B); // REMOVED
+  ppm4   = getPPM(getRs(CH_MQ4),   R0_MQ4,   MQ4_A,   MQ4_B);
+}
+
+/**
+ * Reads BMP180 sensor (Pressure ONLY) and updates values (passed by reference).
+ */
+void bmpReadings(float &pressure, String &condition) {
+  // temperature = bmp.readTemperature(); // REMOVED - Temp comes from DHT11
+  pressure = bmp.readPressure() / 100.0;
+  condition = getWeatherCondition(pressure);
+}
+
+/**
+ * Reads DHT11 sensor and updates values (passed by reference).
+ */
+void dhtReadings(float &temperature, float &humidity) {
+  humidity = dht.readHumidity();
+  temperature = dht.readTemperature(); // Reads temperature as Celsius (the default)
+
+  // Check if any reads failed and exit early (to prevent NaN issues)
+  if (isnan(humidity) || isnan(temperature)) {
+    Serial.println(F("Failed to read from DHT sensor! Keeping previous values."));
+    // Keep last known good values if read fails
+    // The initial values (0) are used if this fails before a good read.
+  } else {
+    // Only update globals if the read was successful
+    temperature = temperature; // Assign to local variable
+    humidity = humidity;       // Assign to local variable
+  }
+}
+
+
+// ---------- CORE LOGIC FUNCTION (Non-Blocking) ----------
+
+/**
+ * Reads data from all sensors and updates the global variables.
+ * DHT/BMP readings are always updated. MQ readings are updated only after calibration.
+ */
+void updateGlobalReadings() {
+  
+  float temp_check = current_temp; // Store current values
+  float hum_check = current_humidity;
+  
+  // 1. DHT11 Reading (Temp, Humidity) - ALWAYS READ THESE
+  dhtReadings(temp_check, hum_check);
+  
+  // Check if DHT read was successful before updating globals
+  if (!isnan(temp_check) && !isnan(hum_check)) {
+    current_temp = temp_check;
+    current_humidity = hum_check;
+  }
+  
+  // 2. BMP Reading (Pressure, Condition) - ALWAYS READ THESE
+  bmpReadings(current_press, current_cond);
+
+  // 3. Gas/PPM Readings - ONLY READ THESE IF CALIBRATED
+  if (R0_MQ135 > 0 && R0_MQ4 > 0) { // MQ-7 check removed
+    mqReadings(current_ppm135, current_ppm4); // MQ-7 removed
+  } else {
+    // Ensure MQ values are reset to 0 if not calibrated
+    current_ppm135 = 0;
+    current_ppm4 = 0;
+  }
+
+  // Print to Serial for debugging
+  Serial.print("T: "); Serial.print(current_temp); 
+  Serial.print("C, H: "); Serial.print(current_humidity); // Added Humidity
+  Serial.print("%, P: "); Serial.print(current_press); 
+  Serial.print("hPa, AQI: "); Serial.print(current_ppm135); Serial.println(" ppm");
+}
+
+// ---------- I2C Scanner (for Debugging) ----------
+// (Unchanged)
+void i2cScanner() {
+  byte error, address;
+  int nDevices;
+
+  Serial.println(F("--- I2C Scanner Initiated ---"));
+  nDevices = 0;
+  for(address = 1; address < 127; address++ ) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+
+    if (error == 0) {
+      Serial.print(F("I2C device found at address 0x"));
+      if (address<16) 
+        Serial.print("0");
+      Serial.println(address,HEX);
+      nDevices++;
+    }
+  }
+  if (nDevices == 0) {
+    Serial.println(F("No I2C devices found. Check SDA (GPIO 21) and SCL (GPIO 22) wiring."));
+  } else {
+    Serial.print(nDevices);
+    Serial.println(F(" device(s) found."));
+  }
+  Serial.println(F("--- Scan Complete ---"));
+  Serial.println();
+  delay(500); // Give time to read the scan
+}
+
+
+// --- WEB SERVER HANDLERS (Consolidated for Speed) ---
+
+/**
+ * Handles the root URL ('/') and serves the complete, self-contained
+ * HTML dashboard with embedded CSS and JavaScript.
+ */
+void handleRoot() {
+  const char* htmlContent = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Air Quality Dashboard</title>
+    <!-- Embedded CSS -->
+    <style>
+        :root {
+            --color-primary: #1e40af; /* Blue 700 */
+            --color-secondary: #fcd34d; /* Amber 300 */
+            --color-bg: #f3f4f6; /* Gray 100 */
+            --color-card-bg: #ffffff;
+            --color-text: #1f2937; /* Gray 800 */
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: Arial, Helvetica, sans-serif; /* Simplified Font */
+            background-color: var(--color-bg);
+            color: var(--color-text);
+            padding: 1rem;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 1.5rem;
+            background-color: #fff;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+        }
+
+        /* Header */
+        header {
+            text-align: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 2px solid #e5e7eb;
+        }
+
+        header h1 {
+            font-size: 1.8rem;
+            font-weight: bold;
+            color: var(--color-primary);
+            margin-bottom: 0.5rem;
+        }
+
+        #last-update {
+            font-size: 0.85rem;
+            color: #6b7280; /* Gray 500 */
+        }
+
+        /* Grid Layout */
+        .grid-layout {
+            display: grid;
+            /* Modified grid to better fit 4 items */
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); 
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .card {
+            background-color: var(--color-card-bg);
+            border-radius: 8px;
+            padding: 1.5rem;
+            display: flex;
+            align-items: center;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            transition: transform 0.2s;
+            border-left: 5px solid;
+        }
+
+        .card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        .card .icon {
+            font-size: 2.5rem;
+            margin-right: 1rem;
+            flex-shrink: 0;
+        }
+
+        .card .data {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .card .value {
+            font-size: 2rem;
+            font-weight: bold;
+            line-height: 1;
+        }
+
+        .card .unit, .card .label {
+            font-size: 0.9rem;
+            color: #6b7280;
+        }
+
+        .card-weather {
+            /* grid-column: 1 / -1; REMOVED */
+            border-left-color: var(--color-secondary);
+        }
+        .card-weather .value { color: #d97706; /* Amber 600 */ }
+
+        #temp-card { border-left-color: #ef4444; /* Red 500 */ }
+        #press-card { border-left-color: #8b5cf6; /* Violet 500 */ }
+        #humidity-card { border-left-color: #3b82f6; /* Blue 500 */ } /* Added */
+
+
+        /* Air Quality Section */
+        .air-quality-grid h2 {
+            font-size: 1.4rem;
+            font-weight: bold;
+            margin-bottom: 1rem;
+            padding-left: 0.5rem;
+            border-left: 3px solid var(--color-primary);
+        }
+
+        .mq-grid {
+            display: grid;
+            /* Modified grid for 2 items */
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 1rem;
+        }
+
+        .mq-card {
+            background-color: #f9fafb; /* Lighter background for AQ */
+            padding: 1rem;
+            border-radius: 6px;
+            text-align: center;
+            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+        }
+
+        .mq-label {
+            font-size: 0.8rem;
+            color: #6b7280;
+            margin-bottom: 0.5rem;
+        }
+
+        .mq-ppm {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: var(--color-text);
+        }
+
+        /* Footer */
+        .footer-note {
+            text-align: center;
+            margin-top: 3rem;
+            padding-top: 1rem;
+            border-top: 1px dashed #d1d5db;
+        }
+
+        .footer-note p {
+            font-size: 0.75rem;
+            color: #9ca3af;
+        }
+
+        /* Responsive adjustments for large screens */
+        @media (min-width: 768px) {
+            .container {
+                padding: 2.5rem;
+            }
+            /*
+            .card-weather {
+                grid-column: span 1; 
+            }
+            */
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Web Based Air Quality Surveillance System</h1>
+            <p id="last-update">Last updated: --:--:--</p>
+        </header>
+
+        <section class="grid-layout">
+            <!-- Weather Conditions Card -->
+            <div class="card" id="aqi-card" style="border-left-color:#3b82f6;">
+    <div class="icon">🌫️</div>
+    <div class="data">
+        <span class="value" id="aqi-status">--</span>
+        <span class="label">Air Quality Status (MQ135)</span>
+    </div>
+</div>
+
+            
+            <!-- Primary Sensor Readings -->
+            <div class="card card-primary" id="temp-card">
+                <div class="icon">🌡️</div>
+                <div class="data">
+                    <span class="value" id="temp-value">--.-</span>
+                    <span class="unit">°C</span>
+                    <span class="label">Temperature (DHT11)</span> <!-- Label updated -->
+                </div>
+            </div>
+
+            <div class="card card-primary" id="press-card">
+                <div class="icon">⏲️</div>
+                <div class="data">
+                    <span class="value" id="press-value">----</span>
+                    <span class="unit">hPa</span>
+                    <span class="label">Pressure</span>
+                </div>
+            </div>
+
+            <!-- New Humidity Card -->
+            <div class="card card-primary" id="humidity-card">
+                <div class="icon">💧</div>
+                <div class="data">
+                    <span class="value" id="humidity-value">--.-</span>
+                    <span class="unit">%</span>
+                    <span class="label">Humidity (DHT11)</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="air-quality-grid">
+            <h2>Air Quality Index (PPM)</h2>
+            <div class="mq-grid">
+<div class="card card-weather">
+    <div class="icon">☁️</div>
+    <div class="data">
+        <span class="value" id="condition-value">---</span>
+        <span class="label">Weather Condition</span>
+    </div>
+</div>
+
+                
+                <!-- MQ-7 Card Removed -->
+                <!--
+                <div class="mq-card mq-7">
+                    <p class="mq-label">MQ-7 (Carbon Monoxide)</p>
+                    <p class="mq-ppm"><span id="ppm7-value">--.-</span> ppm</p>
+                </div>
+                -->
+
+                <div class="mq-card mq-4">
+                    <p class="mq-label">MQ-4 (Methane)</p>
+                    <p class="mq-ppm"><span id="ppm4-value">--.-</span> ppm</p>
+                </div>
+            </div>
+        </section>
+        
+        <section class="footer-note">
+            <p>Dashboard served directly by ESP32. Calibration R0 values are stored in non-volatile memory.</p>
+        </section>
+    </div>
+
+    <!-- Embedded JavaScript -->
+ <script>
+const updateInterval = 5000;
+
+function setAQIStatus(ppm) {
+    const card = document.getElementById('aqi-card');
+    const label = document.getElementById('aqi-status');
+
+    if (ppm <= 50) { card.style.borderLeftColor = "#22c55e"; label.textContent = "Excellent"; }
+    else if (ppm <= 150) { card.style.borderLeftColor = "#eab308"; label.textContent = "Moderate"; }
+    else if (ppm <= 300) { card.style.borderLeftColor = "#f97316"; label.textContent = "Unhealthy"; }
+    else if (ppm <= 600) { card.style.borderLeftColor = "#ef4444"; label.textContent = "Poor"; }
+    else { card.style.borderLeftColor = "#8b5cf6"; label.textContent = "Hazardous"; }
+}
+
+const displayValue = (id, value, decimals, placeholder='--') => {
+    const el = document.getElementById(id);
+    if (value === null || value === undefined || isNaN(value)) el.textContent = placeholder;
+    else el.textContent = value.toFixed(decimals);
+};
+
+async function updateDashboard() {
+    try {
+        const response = await fetch('http://192.168.4.1/data?t=' + Date.now());
+        const data = await response.json();
+
+        displayValue('temp-value', data.tempC, 1);
+        displayValue('humidity-value', data.humidity, 1);
+        displayValue('press-value', data.pressure, 0);
+
+        document.getElementById('condition-value').textContent = data.condition || '---';
+
+        displayValue('ppm135-value', data.ppm135, 1);
+        displayValue('ppm4-value', data.ppm4, 1);
+
+        setAQIStatus(data.ppm135);
+
+        const now = new Date();
+        document.getElementById('last-update').textContent =
+            `Last updated: ${now.getHours()}:${now.getMinutes()}:${now.getSeconds()}`;
+
+    } catch (err) {
+        console.log("Update Failed", err);
+        document.getElementById('last-update').textContent = "Connection Error";
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    updateDashboard();
+    setInterval(updateDashboard, updateInterval);
+});
+</script>
+
+
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", htmlContent);
+}
+
+/**
+ * Serves the live sensor data as a JSON object.
+ */
+void handleSensorData() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  String json = "{";
+  json += "\"tempC\":" + String(current_temp, 1) + ",";
+  json += "\"humidity\":" + String(current_humidity, 1) + ","; // Added
+  json += "\"pressure\":" + String(current_press, 1) + ",";
+  json += "\"condition\":\"" + current_cond + "\",";
+  json += "\"ppm135\":" + String(current_ppm135, 1) + ",";
+  // json += "\"ppm7\":" + String(current_ppm7, 1) + ","; // Removed
+  json += "\"ppm4\":" + String(current_ppm4, 1);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+
+// --- WIFI CONNECTION FUNCTION ---
+// (Unchanged)
+void connectToWiFi() {
+  Serial.println(F("Starting in Access Point Mode..."));
+  
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  IPAddress ip = WiFi.softAPIP();
+
+  Serial.print(F("AP SSID: "));
+  Serial.println(AP_SSID);
+  Serial.print(F("AP IP Address: "));
+  Serial.println(ip);
+
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println(F("AP Active:"));
+  display.println(AP_SSID);
+  display.println(F("Pass: MonkeyLabs"));
+  display.println(F("IP: 192.168.4.1"));
+  display.display();
+  delay(3000); // Show IP on OLED for 3 seconds
+}
+
+
+// --- OLED Display Functions ---
+
+/**
+ * Converts pressure (hPa) to a simple weather condition string.
+ */
+String getWeatherCondition(float pressure_hPa) {
+
+  float seaLevel_hPa = seaLevelPressure(pressure_hPa, 550); // <-- Warananagar Altitude
+
+  if (seaLevel_hPa >= 1020) return "Sunny / Clear";
+  else if (seaLevel_hPa >= 1008) return "Partly Cloudy";
+  else if (seaLevel_hPa >= 995)  return "Cloudy";
+  else if (seaLevel_hPa >= 985)  return "Rain Likely";
+  else return "Stormy / Low Pressure";
+}
+
+
+// (Unchanged)
+void showProjectName() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.print("Web Based");
+  display.setTextSize(2);
+  display.setCursor(0, 20);
+  display.print("AirQuality");
+  display.setTextSize(1);
+  display.setCursor(0, 50);
+  display.print("Surveillance System");
+  display.display();
+}
+/**
+ * Updated to show only two gas sensors
+ */
+void showGasScreen(float ppm135, float ppm4) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Air Quality Data");
+  display.setCursor(0, 16);
+  display.printf("AQI: %.1f ppm", ppm135);
+  display.setCursor(0, 32);
+  display.printf("CH4: %.1f ppm", ppm4); // Moved up
+  // display.setCursor(0, 48); // Removed
+  display.display();
+}
+
+/**
+ * Updated to show Humidity and remove Condition
+ */
+void showWeatherScreen(float temperature, float humidity, float pressure, String condition) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Weather Data");
+  display.setCursor(0, 16);
+  display.printf("Temp: %.1f C", temperature);
+  display.setCursor(0, 32);
+  display.printf("Humi: %.1f %%", humidity); // Added
+  display.setCursor(0, 48);
+  display.printf("Pres: %.1f hPa", pressure);
+  // display.printf("Cond: %s", condition.c_str()); // Removed to fit
+  display.display();
+}
+
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  // Run the scanner to find devices before initializing libraries
+  i2cScanner(); 
+  
+  if (!ads.begin(ADS1115_ADDRESS)) { // Using explicit 0x48 address
+    Serial.println("❌ ADS1115 not found! Halting.");
+    while (1);
+  }
+  ads.setGain(GAIN_ONE); // Set gain to +/- 4.096V
+
+  if (!bmp.begin()) {
+    Serial.println("❌ BMP180 not found! Halting.");
+    while (1);
+  }
+
+  // Initialize DHT11
+  dht.begin();
+  Serial.println(F("DHT11 sensor initialized."));
+
+  // Try 0x3C, then 0x3D for OLED
+  bool oled_ok = false;
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { 
+    oled_ok = true;
+    Serial.println(F("OLED found at 0x3C"));
+  } else if (display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+    oled_ok = true;
+    Serial.println(F("OLED found at 0x3D"));
+  }
+
+  if (!oled_ok) {
+    Serial.println("❌ OLED not found! Halting.");
+    while (1);
+  }
+
+  Serial.println("✅ All devices initialized successfully!");
+  display.clearDisplay();
+  showProjectName();
+
+  // Load Calibration Data from Non-Volatile Storage
+  prefs.begin("calib", false);
+  R0_MQ135 = prefs.getFloat("R0_135", 0);
+  // R0_MQ7   = prefs.getFloat("R0_7", 0); // Removed
+  R0_MQ4   = prefs.getFloat("R0_4", 0);
+  prefs.end(); // Close preferences after reading
+
+  if (R0_MQ135 > 0 && R0_MQ4 > 0) { // Modified check
+    Serial.println("Loaded calibration data from memory.");
+  } else {
+    Serial.println("No calibration data found. Please calibrate.");
+  }
+
+  // --- PRE-LOAD INITIAL SENSOR DATA (New Stabilization Block) ---
+  Serial.println(F("Delaying 2 seconds for sensor stabilization..."));
+  delay(2000); // Wait for sensors (especially DHT) to stabilize
+  updateGlobalReadings(); // Force initial read
+  Serial.println(F("Initial data read complete. Starting server."));
+  
+  // --- Start Wi-Fi Connection (AP Mode) ---
+  connectToWiFi();
+
+  // --- Web Server Setup ---
+  server.on("/", HTTP_GET, handleRoot); 
+  server.on("/data", HTTP_GET, handleSensorData); 
+  server.begin();
+  Serial.println(F("HTTP server started."));
+
+  // Prime the timers
+  lastSensorReadTime = millis();
+  lastOLEDUpdateTime = millis();
+}
+
+// ---------- MAIN LOOP (Non-Blocking) ----------
+void loop() {
+  
+  // 1. CRITICAL: Handle Web Server Requests constantly!
+  server.handleClient();
+
+  // 2. Calibration Check (Non-blocking serial read)
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'c') {
+      // Begin calibration process
+      prefs.begin("calib", false); // Open preferences in R/W mode
+      R0_MQ135 = calibrateSensor(CH_MQ135, RATIO_CLEAN_MQ135, "MQ135");
+      // R0_MQ7   = calibrateSensor(CH_MQ7,   RATIO_CLEAN_MQ7,   "MQ7"); // Removed
+      R0_MQ4   = calibrateSensor(CH_MQ4,   RATIO_CLEAN_MQ4,   "MQ4");
+
+      // Save new R0 values to memory
+      prefs.putFloat("R0_135", R0_MQ135);
+      // prefs.putFloat("R0_7",   R0_MQ7); // Removed
+      prefs.putFloat("R0_4",   R0_MQ4);
+      prefs.end();
+      Serial.println("✅ Calibration data saved.\n");
+    
+    } else if (cmd == 'r') {
+      // Clear calibration data
+      prefs.begin("calib", false);
+      prefs.clear();
+      prefs.end();
+      Serial.println("❌ Calibration data cleared. Restarting...");
+      delay(200);
+      ESP.restart();
+    }
+  }
+
+  // 3. Sensor Reading Interval (Non-blocking: Reads data every 5 seconds)
+  if (millis() - lastSensorReadTime >= sensorInterval) {
+    lastSensorReadTime = millis();
+    updateGlobalReadings(); // Reads all sensors, updates global data, and prints to serial
+  }
+
+  // 4. OLED Display Rotation (Non-blocking: Rotates screen every 3 seconds)
+  if (millis() - lastOLEDUpdateTime >= oledInterval) {
+    lastOLEDUpdateTime = millis();
+
+    if (R0_MQ135 > 0 && R0_MQ4 > 0) { // Modified check
+      // Cycle between the two data screens
+      if (currentOLED_Screen == 1) {
+        showGasScreen(current_ppm135, current_ppm4); // Modified call
+        currentOLED_Screen = 2;
+      } else {
+        showWeatherScreen(current_temp, current_humidity, current_press, current_cond); // Modified call
+        currentOLED_Screen = 1;
+      }
+    } else {
+      // Show Calibration screen if R0 is 0
+      display.clearDisplay();
+      display.setCursor(0, 20);
+      display.setTextSize(1);
+      display.print("Type 'c' in Serial");
+      display.setCursor(0, 32);
+      display.print("to Calibrate Sensors");
+      display.display();
+    }
+  }
+}
