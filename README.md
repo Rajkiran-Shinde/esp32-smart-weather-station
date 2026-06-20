@@ -6,12 +6,12 @@
 
 A highly responsive, completely offline local air quality and weather surveillance system built on the ESP32. This project serves a beautiful, asynchronous web dashboard, drives a local OLED telemetry display, and utilizes non-volatile flash memory for precise gas sensor calibration.
 
-![Images](Dashboard.jpeg) ## 📌 Project Overview
+![Web Dashboard](Images/Dashboard.jpeg) ## 📌 Project Overview
 Unlike standard IoT projects that rely on cloud services (like Blynk or ThingSpeak), this system is **100% self-contained**. The ESP32 hosts its own Wi-Fi Access Point (AP) and Web Server, processes analog signals through a dedicated 16-bit ADC, and calculates precise PPM (Parts Per Million) values locally.
 
 This project was originally a monolithic Arduino script but has been entirely refactored into a **scalable, object-oriented C++ architecture** using PlatformIO to demonstrate professional embedded software engineering practices.
 
-![Images](Hardware.jpeg) ---
+![Hardware Setup](Images/Hardware.jpeg) ---
 
 ## 🚀 Pushing the ESP32: Advanced Engineering Implementations
 
